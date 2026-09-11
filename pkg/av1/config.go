@@ -1,6 +1,10 @@
 package av1
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
+)
 
 // SequenceHeaderInfo holds parsed fields from an AV1 Sequence Header OBU.
 // Used for av1C box generation, MIME codec strings, and resolution detection.
@@ -64,25 +68,32 @@ func ParseSequenceHeaderInfo(obu []byte) *SequenceHeaderInfo {
 		// reduced_still has no frame dimensions in the normal path;
 		// leave width/height = 0 (caller should use defaults)
 		info.BitDepth = 8
+		if br.eof {
+			return nil
+		}
 		return info
 	}
 
 	// timing_info_present_flag
+	var decoderModelInfo bool
+	var bufferDelayLength uint32
+
 	if br.readBits(1) == 1 {
-		br.readBits(32) // num_units_in_display_tick
-		br.readBits(32) // time_scale
+		br.readBits(32)          // num_units_in_display_tick
+		br.readBits(32)          // time_scale
 		if br.readBits(1) == 1 { // equal_picture_interval
 			br.readUVLC() // num_ticks_per_picture_minus_1
 		}
 		if br.readBits(1) == 1 { // decoder_model_info_present_flag
-			br.readBits(5)  // buffer_delay_length_minus_1
-			br.readBits(32) // num_units_in_decoding_tick
-			br.readBits(5)  // buffer_removal_time_length_minus_1
-			br.readBits(5)  // frame_presentation_time_length_minus_1
+			decoderModelInfo = true
+			bufferDelayLength = br.readBits(5) + 1 // buffer_delay_length_minus_1
+			br.readBits(32)                        // num_units_in_decoding_tick
+			br.readBits(5)                         // buffer_removal_time_length_minus_1
+			br.readBits(5)                         // frame_presentation_time_length_minus_1
 		}
 	}
 
-	br.readBits(1) // initial_display_delay_present_flag
+	initialDisplayDelay := br.readBits(1) == 1 // initial_display_delay_present_flag
 
 	// operating points
 	opPoints := br.readBits(5) + 1
@@ -97,6 +108,14 @@ func ParseSequenceHeaderInfo(obu []byte) *SequenceHeaderInfo {
 			if i == 0 {
 				info.Tier = byte(t)
 			}
+		}
+		if decoderModelInfo && br.readBits(1) == 1 { // decoder_model_present_for_this_op
+			br.readBits(bufferDelayLength) // decoder_buffer_delay
+			br.readBits(bufferDelayLength) // encoder_buffer_delay
+			br.readBits(1)                 // low_delay_mode_flag
+		}
+		if initialDisplayDelay && br.readBits(1) == 1 { // initial_display_delay_present_for_this_op
+			br.readBits(4) // initial_display_delay_minus_1
 		}
 	}
 
@@ -171,27 +190,53 @@ func ParseSequenceHeaderInfo(obu []byte) *SequenceHeaderInfo {
 	}
 
 	// color_description_present_flag
+	var colorPrimaries, transferChars, matrixCoeffs uint32 = 2, 2, 2 // unspecified
 	if br.readBits(1) == 1 {
-		br.readBits(8) // color_primaries
-		br.readBits(8) // transfer_characteristics
-		br.readBits(8) // matrix_coefficients
+		colorPrimaries = br.readBits(8)
+		transferChars = br.readBits(8)
+		matrixCoeffs = br.readBits(8)
 	}
 
-	if info.Monochrome {
-		br.readBits(1) // color_range
-		info.ChromaSubsamplingX = 0
-		info.ChromaSubsamplingY = 0
-	} else if info.BitDepth == 12 {
-		br.readBits(1) // color_range
-		info.ChromaSubsamplingX = byte(br.readBits(1))
-		info.ChromaSubsamplingY = byte(br.readBits(1))
-		if info.ChromaSubsamplingX == 1 && info.ChromaSubsamplingY == 1 {
-			info.ChromaSamplePos = byte(br.readBits(2))
-		}
-	} else {
+	// AV1 spec 5.5.2: the subsampling is implied by seq_profile and bit depth,
+	// and only coded for 12-bit profile 2
+	switch {
+	case info.Monochrome:
 		br.readBits(1) // color_range
 		info.ChromaSubsamplingX = 1
 		info.ChromaSubsamplingY = 1
+	case colorPrimaries == 1 && transferChars == 13 && matrixCoeffs == 0:
+		// sRGB with the identity matrix is 4:4:4 full range, no color_range bit
+		info.ChromaSubsamplingX = 0
+		info.ChromaSubsamplingY = 0
+	default:
+		br.readBits(1) // color_range
+		switch {
+		case info.Profile == 0:
+			info.ChromaSubsamplingX = 1
+			info.ChromaSubsamplingY = 1
+		case info.Profile == 1:
+			info.ChromaSubsamplingX = 0
+			info.ChromaSubsamplingY = 0
+		case info.BitDepth == 12:
+			info.ChromaSubsamplingX = byte(br.readBits(1))
+			if info.ChromaSubsamplingX == 1 {
+				info.ChromaSubsamplingY = byte(br.readBits(1))
+			} else {
+				info.ChromaSubsamplingY = 0
+			}
+		default:
+			info.ChromaSubsamplingX = 1
+			info.ChromaSubsamplingY = 0
+		}
+		if info.ChromaSubsamplingX == 1 && info.ChromaSubsamplingY == 1 {
+			info.ChromaSamplePos = byte(br.readBits(2))
+		}
+	}
+
+	// a header that ran off the end parsed into garbage, and callers rely on
+	// nil to fall back instead of writing a 1x1 track
+	if br.eof {
+		return nil
 	}
 
 	return info
@@ -290,6 +335,25 @@ func EncodeConfig(seqHdr []byte) []byte {
 	return conf
 }
 
+// ConfigToCodec parses an AV1CodecConfigurationRecord (av1C) into a core.Codec.
+// The record is carried in the Enhanced-RTMP/FLV PacketTypeSequenceStart body
+// and in the ISOBMFF av1C box. The sequence header OBU from configOBUs is kept
+// raw in FmtpLine, the same convention the MP4 consumer uses, so EncodeConfig
+// can write it back out unchanged.
+func ConfigToCodec(conf []byte) *core.Codec {
+	codec := &core.Codec{
+		Name:        core.CodecAV1,
+		ClockRate:   90000,
+		PayloadType: core.PayloadTypeRAW,
+	}
+	if len(conf) > 4 {
+		if seqHdr := SequenceHeader(conf[4:]); seqHdr != nil {
+			codec.FmtpLine = string(seqHdr)
+		}
+	}
+	return codec
+}
+
 // DecodeSequenceHeader parses a Sequence Header OBU and returns width and height.
 // Convenience wrapper around ParseSequenceHeaderInfo.
 func DecodeSequenceHeader(obu []byte) (width, height uint16) {
@@ -302,7 +366,8 @@ func DecodeSequenceHeader(obu []byte) (width, height uint16) {
 // bitReader is a simple bit-level reader.
 type bitReader struct {
 	data   []byte
-	offset int // bit offset
+	offset int  // bit offset
+	eof    bool // set when a read ran past the end of data
 }
 
 func (r *bitReader) readBits(n uint32) uint32 {
@@ -311,6 +376,7 @@ func (r *bitReader) readBits(n uint32) uint32 {
 		byteIdx := r.offset / 8
 		bitIdx := 7 - (r.offset % 8)
 		if byteIdx >= len(r.data) {
+			r.eof = true
 			return val
 		}
 		val = (val << 1) | uint32((r.data[byteIdx]>>uint(bitIdx))&1)
